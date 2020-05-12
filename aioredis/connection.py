@@ -7,6 +7,7 @@ import sys
 from functools import partial
 from collections import deque
 from contextlib import contextmanager
+from async_timeout import timeout as async_timeout
 
 from .util import (
     encode_command,
@@ -18,6 +19,7 @@ from .util import (
     decode,
     parse_url,
     get_event_loop,
+    CloseEvent,
     )
 from .parser import Reader
 from .stream import open_connection, open_unix_connection
@@ -162,10 +164,8 @@ class RedisConnection(AbcConnection):
         self._reader_task = asyncio.ensure_future(self._read_data())
         self._close_msg = None
         self._db = 0
-        self._closing = False
-        self._closed = False
-        self._close_state = asyncio.Event()
-        self._reader_task.add_done_callback(lambda x: self._close_state.set())
+        self._close_state = CloseEvent(self._do_close)
+        self._close_reason = None
         self._in_transaction = None
         self._transaction_error = None  # XXX: never used?
         self._in_pubsub = 0
@@ -173,6 +173,12 @@ class RedisConnection(AbcConnection):
         self._pubsub_patterns = coerced_keys_dict()
         self._encoding = encoding
         self._pipeline_buffer = None
+        self._loop = get_event_loop()
+
+        self._ping_task = None
+        interval = 10
+        if interval:
+            self._ping_task = asyncio.create_task(self._ping(interval))
 
     def __repr__(self):
         return '<RedisConnection [db:{}]>'.format(self._db)
@@ -185,8 +191,7 @@ class RedisConnection(AbcConnection):
             try:
                 obj = await self._reader.readobj()
             except asyncio.CancelledError:
-                # NOTE: reader can get cancelled from `close()` method only.
-                last_error = RuntimeError('this is unexpected')
+                last_error = None
                 break
             except ProtocolError as exc:
                 # ProtocolError is fatal
@@ -201,6 +206,8 @@ class RedisConnection(AbcConnection):
                 last_error = exc
                 break
             else:
+                self._last_received = self._loop.time()
+
                 if (obj == b'' or obj is None) and self._reader.at_eof():
                     logger.debug("Connection has been closed by server,"
                                  " response: %r", obj)
@@ -214,8 +221,10 @@ class RedisConnection(AbcConnection):
                     self._process_pubsub(obj)
                 else:
                     self._process_data(obj)
-        self._closing = True
-        get_event_loop().call_soon(self._do_close, last_error)
+
+        if last_error:
+            # Schedule close if it wasnt cancelled explicitly from close()
+            self.close(last_error)
 
     def _process_data(self, obj):
         """Processes command results."""
@@ -277,6 +286,33 @@ class RedisConnection(AbcConnection):
                 self._process_data(data or b'PONG')
         else:
             logger.warning("Unknown pubsub message received %r", obj)
+
+    async def _ping(self, interval):
+        last_error = ConnectionClosedError("Connection has been closed by server")
+        # TODO Configure grace period
+        grace_period = interval * 1.2
+        try:
+            while not self.closed:
+                # TODO Should we check for auth first?
+                with async_timeout(grace_period):
+                    res = await self.execute('PING')
+
+                await asyncio.sleep(interval)
+
+                seconds_since_last_message = self._loop.time() - self._last_received
+                if seconds_since_last_message > grace_period:
+                    logger.debug(f'Missing responses for {seconds_since_last_message} seconds, disconnecting...')
+                    break
+
+        except asyncio.CancelledError:
+            logger.debug('Ping task canceled externally')
+            last_error = None
+        except asyncio.TimeoutError as err:
+            logger.debug('Timeout sending ping command, disconnecting...')
+        finally:
+            # Schedule close if task wasnt cancelled explicitly from close()
+            if last_error:
+                self.close(last_error)
 
     @contextmanager
     def _buffered(self):
@@ -389,15 +425,17 @@ class RedisConnection(AbcConnection):
             self._pipeline_buffer.extend(cmd)
         return asyncio.gather(*res)
 
-    def close(self):
+    def close(self, reason=None):
         """Close connection."""
-        self._do_close(ConnectionForcedCloseError())
+        if reason is None:
+            reason = ConnectionForcedCloseError()
 
-    def _do_close(self, exc):
-        if self._closed:
-            return
-        self._closed = True
-        self._closing = False
+        if not self._close_state.is_set():
+            self._close_reason = reason
+            self._close_state.set()
+
+    async def _do_close(self):
+        assert self._close_reason is not None, "Close reason isn't set"
         self._writer.transport.close()
         self._reader_task.cancel()
         self._reader_task = None
@@ -405,32 +443,36 @@ class RedisConnection(AbcConnection):
         self._reader = None
         self._pipeline_buffer = None
 
-        if exc is not None:
-            self._close_msg = str(exc)
+        if self._ping_task:
+            self._ping_task.cancel()
+            self._ping_task = None
 
+        self._close_msg = str(self._close_reason)
+
+        futures_to_wait = []
         while self._waiters:
             waiter, *spam = self._waiters.popleft()
             logger.debug("Cancelling waiter %r", (waiter, spam))
-            if exc is None:
-                _set_exception(waiter, ConnectionForcedCloseError())
-            else:
-                _set_exception(waiter, exc)
+            _set_exception(waiter, self._close_reason)
+            futures_to_wait.append(waiter)
+        await asyncio.gather(*futures_to_wait, return_exceptions=True)
+
         while self._pubsub_channels:
             _, ch = self._pubsub_channels.popitem()
             logger.debug("Closing pubsub channel %r", ch)
-            ch.close(exc)
+            ch.close(self._close_reason)
         while self._pubsub_patterns:
             _, ch = self._pubsub_patterns.popitem()
             logger.debug("Closing pubsub pattern %r", ch)
-            ch.close(exc)
+            ch.close(self._close_reason)
 
     @property
     def closed(self):
         """True if connection is closed."""
-        closed = self._closing or self._closed
+        closed = self._close_state.is_set()
         if not closed and self._reader and self._reader.at_eof():
-            self._closing = closed = True
-            get_event_loop().call_soon(self._do_close, None)
+            closed = True
+            self.close()
         return closed
 
     async def wait_closed(self):
